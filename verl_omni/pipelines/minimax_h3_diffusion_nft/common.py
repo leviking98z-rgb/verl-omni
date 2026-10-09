@@ -786,7 +786,9 @@ class MiniMaxH3RolloutWeightSyncMixin:
         needs_rope = not getattr(self, "_rope_inv_freq_loaded", False)
         if needs_rope:
             rope_len = arch.rope_inv_freq_len
-            inv_freq = 10000.0 ** (-(torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len)))
+            inv_freq = 1.0 / (
+                10000.0 ** (torch.arange(0, 2 * rope_len, 2, dtype=torch.float32) / (2 * rope_len))
+            )
             # vllm-omni 0.27 requires each weight-prefix group to be contiguous;
             # the rope table must stay inside the "transformer." run.
             insert_at = next(

@@ -387,12 +387,12 @@ class _RecordingLoader:
 
 
 class _StubSyncPipeline(MiniMaxH3RolloutWeightSyncMixin, _RecordingLoader):
-    def __init__(self):
+    def __init__(self, rope_len=_ROPE_LEN):
         self.transformer = MagicMock()
         self.transformer.arch.num_attention_heads = _HEADS
         self.transformer.arch.attention_head_dim = _HEAD_DIM
         self.transformer.arch.ffn_hidden_size = _FF_HALF
-        self.transformer.arch.rope_inv_freq_len = _ROPE_LEN
+        self.transformer.arch.rope_inv_freq_len = rope_len
 
 
 class TestMiniMaxH3RolloutWeightSync:
@@ -403,8 +403,25 @@ class TestMiniMaxH3RolloutWeightSync:
 
         emitted = dict(pipeline.received)
         assert "transformer.rope.inv_freq" in emitted
-        expected = 10000.0 ** (-(torch.arange(0, 2 * _ROPE_LEN, 2, dtype=torch.float32) / (2 * _ROPE_LEN)))
-        torch.testing.assert_close(emitted["transformer.rope.inv_freq"], expected)
+        expected = 1.0 / (10000.0 ** (torch.arange(0, 2 * _ROPE_LEN, 2, dtype=torch.float32) / (2 * _ROPE_LEN)))
+        torch.testing.assert_close(emitted["transformer.rope.inv_freq"], expected, rtol=0, atol=0)
+
+    def test_rope_inv_freq_matches_native_bytes(self):
+        # Independently generated from the unmodified UniRL native implementation at
+        # unirl/models/minimax_h3/vendor/transformer_minimax_h3.py.
+        # Source SHA256: 1f167011d34d39a46db62fae2a2e8ec2314293de6ccbd73724224e57c9649c8d
+        # Native bytes SHA256: 9cc63b858a37a16bf14e559754d6fee5f50ae74aabfce29fec9097b70902849c
+        expected_bytes = bytes.fromhex(
+            "0000803f9af50f3f9be8a13e8718363ecdcccc3dc255663de386013d39ad913c"
+            "0ad7233c9c44b83b383e4f3b2815e93a6f12833a166a133a60cba53953773a39"
+        )
+        pipeline = _StubSyncPipeline(rope_len=16)
+        pipeline.load_weights([])
+
+        actual = dict(pipeline.received)["transformer.rope.inv_freq"]
+        assert actual.dtype == torch.float32
+        assert actual.shape == (16,)
+        assert actual.contiguous().numpy().tobytes() == expected_bytes
 
     def test_rope_inv_freq_is_loaded_once(self):
         pipeline = _StubSyncPipeline()
