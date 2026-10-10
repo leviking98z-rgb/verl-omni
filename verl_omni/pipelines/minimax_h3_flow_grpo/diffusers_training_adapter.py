@@ -113,7 +113,11 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         device: str,
     ) -> None:
         num_steps = model_config.pipeline.num_inference_steps
-        video_sigmas, audio_sigmas = h3_sigma_schedules(num_steps)
+        video_sigmas, audio_sigmas = h3_sigma_schedules(
+            num_steps,
+            video_shift=model_config.pipeline.video_flow_shift,
+            audio_shift=model_config.pipeline.audio_flow_shift,
+        )
         video_scheduler, audio_scheduler = scheduler
         configure_flow_scheduler(video_scheduler, video_sigmas, device)
         configure_flow_scheduler(audio_scheduler, audio_sigmas, device)
@@ -320,7 +324,12 @@ class MiniMaxH3FlowGRPO(DiffusionModelBase):
         video_weight = video[0, video_update_mask].numel()
         audio_weight = audio[0, audio_update_mask].numel()
         total_weight = video_weight + audio_weight
-        log_prob = combine_log_probs(video_log_prob, audio_log_prob)
+        log_prob = combine_log_probs(
+            video_log_prob,
+            audio_log_prob,
+            video_weight=video_weight / total_weight,
+            audio_weight=audio_weight / total_weight,
+        )
         mean = flatten_joint_latents(video_out[2], audio_out[2])
         video_std = video_out[3].reshape(-1).mean()
         audio_std = audio_out[3].reshape(-1).mean()

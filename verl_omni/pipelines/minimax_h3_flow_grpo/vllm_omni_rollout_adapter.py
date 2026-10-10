@@ -38,6 +38,7 @@ from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence_ref2va_blocks,
 )
 from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+    minimax_h3_patchify_video_latent,
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
@@ -63,9 +64,69 @@ from .common import (
     h3_sigma_schedules,
     sample_h3_transition,
 )
+from .paired_noise import cpu_generator, derive_denoise_seed, derive_initial_seed
 from .weight_sync import MiniMaxH3WeightSyncMixin
 
 __all__ = ["MiniMaxH3PipelineWithLogProb"]
+
+
+_STORAGE_DTYPES = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def _storage_dtype(value: str, name: str) -> torch.dtype:
+    try:
+        return _STORAGE_DTYPES[str(value).lower()]
+    except KeyError as exc:
+        expected = sorted(_STORAGE_DTYPES)
+        raise ValueError(f"Unsupported MiniMax H3 {name}={value!r}; expected one of {expected}.") from exc
+
+
+def _select_sde_steps(
+    num_transitions: int,
+    *,
+    sde_indices: Sequence[int] | None,
+    window_size: int | None,
+    window_range: Sequence[int] | None,
+    contiguous: bool,
+    seed: int,
+) -> set[int]:
+    """Resolve stochastic transitions, validating explicit indices first."""
+    if sde_indices is not None:
+        indices = list(sde_indices)
+        if not indices:
+            raise ValueError("MiniMax H3 sde_indices must select at least one transition.")
+        if any(isinstance(index, bool) or not isinstance(index, int) for index in indices):
+            raise TypeError(f"MiniMax H3 sde_indices must contain integers, got {indices!r}.")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"MiniMax H3 sde_indices contains duplicates: {indices!r}.")
+        invalid = [index for index in indices if index < 0 or index >= num_transitions]
+        if invalid:
+            raise ValueError(f"MiniMax H3 sde_indices {invalid!r} are outside [0, {num_transitions}); got {indices!r}.")
+        return set(indices)
+
+    if window_size is None:
+        return set(range(num_transitions))
+
+    window_size = int(window_size)
+    low, high = window_range or [0, num_transitions]
+    low, high = int(low), min(int(high), num_transitions)
+    if low < 0 or window_size <= 0 or high - low < window_size:
+        raise ValueError(
+            f"Invalid MiniMax H3 SDE window: size={window_size}, range={[low, high]}, transitions={num_transitions}."
+        )
+    step_generator = torch.Generator().manual_seed(seed)
+    if contiguous:
+        start = int(torch.randint(low, high - window_size + 1, (1,), generator=step_generator).item())
+        return set(range(start, start + window_size))
+    order = torch.randperm(high - low, generator=step_generator)[:window_size].tolist()
+    return {low + index for index in order}
 
 
 def _pad_first_dim(value: torch.Tensor, target: int) -> torch.Tensor:
@@ -101,10 +162,15 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         self.install_h3_lora_layout()
         self._flow_grpo_noise_level = 0.8
         self._flow_grpo_sde_type = "cps"
+        self._flow_grpo_sde_indices: list[int] | None = None
         self._flow_grpo_window_size: int | None = None
         self._flow_grpo_window_range: list[int] | None = None
         self._flow_grpo_sde_contiguous = True
         self._flow_grpo_seed = 42
+        self._paired_base_seed: int | None = None
+        self._paired_trajectory_key: str | None = None
+        self._flow_grpo_trajectory_dtype = torch.float32
+        self._flow_grpo_logprob_dtype = torch.float32
         self._flow_grpo_trajectory: dict[str, torch.Tensor] = {}
         self._h3_max_text_len = 1024
 
@@ -112,15 +178,39 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         if request.sampling_params.extra_args is None:
             request.sampling_params.extra_args = {}
         extra_args = request.sampling_params.extra_args
+        video_shift = extra_args.pop("video_flow_shift", None)
+        if video_shift is not None:
+            configured_shift = extra_args.get("flow_shift")
+            if configured_shift is not None and not math.isclose(
+                float(configured_shift), float(video_shift), rel_tol=0.0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    "MiniMax H3 received conflicting video sigma shifts: "
+                    f"flow_shift={configured_shift} and video_flow_shift={video_shift}."
+                )
+            extra_args["flow_shift"] = float(video_shift)
         if int(request.sampling_params.num_outputs_per_prompt or 1) != 1:
             raise NotImplementedError("MiniMax H3 FlowGRPO v1 supports one output per request.")
         self._flow_grpo_noise_level = float(extra_args.get("noise_level", 0.8))
         self._flow_grpo_sde_type = str(extra_args.get("sde_type", "cps"))
+        self._flow_grpo_sde_indices = extra_args.get("sde_indices")
         self._flow_grpo_window_size = extra_args.get("sde_window_size")
         self._flow_grpo_window_range = extra_args.get("sde_window_range")
         self._flow_grpo_sde_contiguous = bool(extra_args.get("sde_contiguous", True))
         global_step = int(extra_args.get("global_steps", 1))
         self._flow_grpo_seed = int(extra_args.get("sde_window_seed", 42)) + max(global_step - 1, 0)
+        paired_base_seed = extra_args.get("paired_base_seed")
+        paired_trajectory_key = extra_args.get("paired_trajectory_key")
+        if (paired_base_seed is None) != (paired_trajectory_key is None):
+            raise ValueError("paired_base_seed and paired_trajectory_key must be provided together")
+        self._paired_base_seed = None if paired_base_seed is None else int(paired_base_seed)
+        self._paired_trajectory_key = None if paired_trajectory_key is None else str(paired_trajectory_key)
+        if self._paired_base_seed is not None and self._flow_grpo_sde_type != "cps":
+            raise ValueError("MiniMax H3 paired rollout currently requires sde_type='cps'.")
+        self._flow_grpo_trajectory_dtype = _storage_dtype(
+            extra_args.get("trajectory_dtype", "float32"), "trajectory_dtype"
+        )
+        self._flow_grpo_logprob_dtype = _storage_dtype(extra_args.get("logprob_dtype", "float32"), "logprob_dtype")
         self._h3_max_text_len = int(request.sampling_params.max_sequence_length or 1024)
         self._flow_grpo_trajectory = {}
 
@@ -239,13 +329,33 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         keyframe_frame_indices: list[int] | None = None,
         base_schedule: Sequence[float] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        target_video_rows, target_audio_rows = self._initial_noise(
-            seed=seed,
-            latent_t=latent_t,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            audio_t=audio_t,
-        )
+        paired_key = getattr(self, "_paired_trajectory_key", None)
+        paired_base_seed = getattr(self, "_paired_base_seed", None)
+        if paired_key is None:
+            target_video_rows, target_audio_rows = self._initial_noise(
+                seed=seed,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+            )
+        else:
+            video = torch.randn(
+                1,
+                24,
+                latent_t,
+                latent_h,
+                latent_w,
+                generator=cpu_generator(derive_initial_seed(paired_base_seed, paired_key)),
+                dtype=torch.float32,
+            )
+            target_video_rows = minimax_h3_patchify_video_latent(video, patch_size=(1, 2, 2))
+            target_audio_rows = torch.randn(
+                audio_t * 2,
+                32,
+                generator=cpu_generator(derive_initial_seed(paired_base_seed, f"{paired_key}::audio")),
+                dtype=torch.float32,
+            )
         target_video_rows = target_video_rows.to(self.device)
         target_audio_rows = target_audio_rows.to(self.device)
 
@@ -359,25 +469,26 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
         configure_flow_scheduler(video_scheduler, video_sigmas, self.device)
         configure_flow_scheduler(audio_scheduler, audio_sigmas, self.device)
         num_transitions = num_steps - 1
-        if self._flow_grpo_window_size is None:
-            selected = set(range(num_transitions))
-        else:
-            window_size = int(self._flow_grpo_window_size)
-            low, high = self._flow_grpo_window_range or [0, num_transitions]
-            high = min(high, num_transitions)
-            if low < 0 or window_size <= 0 or high - low < window_size:
-                raise ValueError(
-                    f"Invalid MiniMax H3 SDE window: size={window_size}, "
-                    f"range={[low, high]}, transitions={num_transitions}."
-                )
-            step_generator = torch.Generator().manual_seed(self._flow_grpo_seed)
-            if self._flow_grpo_sde_contiguous:
-                start = int(torch.randint(low, high - window_size + 1, (1,), generator=step_generator).item())
-                selected = set(range(start, start + window_size))
-            else:
-                order = torch.randperm(high - low, generator=step_generator)[:window_size].tolist()
-                selected = {low + index for index in order}
-        generator = torch.Generator(device=self.device).manual_seed(seed + 1)
+        selected = _select_sde_steps(
+            num_transitions,
+            sde_indices=getattr(self, "_flow_grpo_sde_indices", None),
+            window_size=self._flow_grpo_window_size,
+            window_range=self._flow_grpo_window_range,
+            contiguous=self._flow_grpo_sde_contiguous,
+            seed=self._flow_grpo_seed,
+        )
+        generator = None if paired_key is not None else torch.Generator(device=self.device).manual_seed(seed + 1)
+        trajectory_dtype = getattr(self, "_flow_grpo_trajectory_dtype", torch.float32)
+        logprob_dtype = getattr(self, "_flow_grpo_logprob_dtype", torch.float32)
+        if paired_key is not None:
+            video_rows = video_rows.to(dtype=trajectory_dtype)
+            audio_rows = audio_rows.to(dtype=trajectory_dtype)
+            branch.x_base = branch.x_base.to(dtype=trajectory_dtype)
+            branch.audio_x_base = branch.audio_x_base.to(dtype=trajectory_dtype)
+            if visual_anchor is not None:
+                visual_anchor = visual_anchor.to(dtype=trajectory_dtype)
+            if audio_anchor is not None:
+                audio_anchor = audio_anchor.to(dtype=trajectory_dtype)
         current_latents = []
         next_latents = []
         log_probs = []
@@ -404,6 +515,13 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                     )
                     video_velocity, audio_velocity = transformer(**model_inputs)
                     is_selected = step in selected
+                    video_generator = generator
+                    audio_generator = generator
+                    if paired_key is not None and is_selected:
+                        video_generator = cpu_generator(derive_denoise_seed(paired_base_seed, step, paired_key))
+                        audio_generator = cpu_generator(
+                            derive_denoise_seed(paired_base_seed, step, f"{paired_key}::audio")
+                        )
                     video_transition = sample_h3_transition(
                         video_scheduler,
                         video_rows[branch.update_mask_dev].unsqueeze(0),
@@ -411,7 +529,7 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                         step,
                         noise_level=self._flow_grpo_noise_level if is_selected else 0.0,
                         sde_type=self._flow_grpo_sde_type,
-                        generator=generator,
+                        generator=video_generator,
                         return_log_prob=is_selected,
                     )
                     audio_transition = sample_h3_transition(
@@ -421,15 +539,17 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                         step,
                         noise_level=self._flow_grpo_noise_level if is_selected else 0.0,
                         sde_type=self._flow_grpo_sde_type,
-                        generator=generator,
+                        generator=audio_generator,
                         return_log_prob=is_selected,
                     )
                     next_video_rows = video_rows.clone()
-                    next_video_rows[branch.update_mask_dev] = video_transition[0][0]
+                    next_video_rows[branch.update_mask_dev] = video_transition[0][0].to(dtype=next_video_rows.dtype)
                     if visual_anchor is not None:
                         next_video_rows[~branch.update_mask_dev] = visual_anchor
                     next_audio_rows = audio_rows.clone()
-                    next_audio_rows[branch.audio_update_mask_dev] = audio_transition[0][0]
+                    next_audio_rows[branch.audio_update_mask_dev] = audio_transition[0][0].to(
+                        dtype=next_audio_rows.dtype
+                    )
                     if audio_anchor is not None:
                         next_audio_rows[~branch.audio_update_mask_dev] = audio_anchor
                     if is_selected:
@@ -445,11 +565,40 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
                         else:
                             current_video, current_audio = video_rows, audio_rows
                             next_video, next_audio = next_video_rows, next_audio_rows
+                        scored_next_video = next_video_rows[branch.update_mask_dev]
+                        scored_next_audio = next_audio_rows[branch.audio_update_mask_dev]
+                        if paired_key is not None:
+                            video_log_prob = (
+                                -(scored_next_video.unsqueeze(0).float().detach() - video_transition[2])
+                                .square()
+                                .mean(dim=(1, 2))
+                            )
+                            audio_log_prob = (
+                                -(scored_next_audio.unsqueeze(0).float().detach() - audio_transition[2])
+                                .square()
+                                .mean(dim=(1, 2))
+                            )
                         current_latents.append(
-                            flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0))
+                            flatten_joint_latents(current_video.unsqueeze(0), current_audio.unsqueeze(0)).to(
+                                dtype=trajectory_dtype
+                            )
                         )
-                        next_latents.append(flatten_joint_latents(next_video.unsqueeze(0), next_audio.unsqueeze(0)))
-                        log_probs.append(combine_log_probs(video_log_prob, audio_log_prob))
+                        next_latents.append(
+                            flatten_joint_latents(next_video.unsqueeze(0), next_audio.unsqueeze(0)).to(
+                                dtype=trajectory_dtype
+                            )
+                        )
+                        video_weight = scored_next_video.numel()
+                        audio_weight = scored_next_audio.numel()
+                        total_weight = video_weight + audio_weight
+                        log_probs.append(
+                            combine_log_probs(
+                                video_log_prob,
+                                audio_log_prob,
+                                video_weight=video_weight / total_weight,
+                                audio_weight=audio_weight / total_weight,
+                            ).to(dtype=logprob_dtype)
+                        )
                         step_indices.append(step)
                         selected_video_sigmas.append(video_sigma)
                         selected_audio_sigmas.append(audio_sigma)
@@ -497,6 +646,23 @@ class MiniMaxH3PipelineWithLogProb(MiniMaxH3WeightSyncMixin, MiniMaxH3Pipeline):
             audio_channel=2,
         )
         return video_latent, audio_latent
+
+    def decode(
+        self,
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        video_dtype = next(self.video_vae.parameters()).dtype
+        audio_dtype = next(self.audio_vae.parameters()).dtype
+        return super().decode(
+            video_latent.to(dtype=video_dtype),
+            audio_latent.to(dtype=audio_dtype),
+            height=height,
+            width=width,
+        )
 
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:

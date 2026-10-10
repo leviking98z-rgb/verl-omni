@@ -30,7 +30,7 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
     _pad_prompt_extra_field,
     _pad_reference_rows,
 )
-from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
+from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ, _paired_trajectory_key
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 from verl_omni.trainer.diffusion.v1 import tq_utils
 
@@ -90,6 +90,52 @@ def test_prompt_cache_routing_affinity_requires_sample_uid():
     second_request_id = agent_loop._get_routing_request_id(None)
 
     assert first_request_id != second_request_id
+
+
+def test_paired_trajectory_key_uses_dataset_step_prompt_and_session() -> None:
+    prompt = {"extra_info": {"logical_step": 2, "prompt_id": "p7"}}
+
+    assert _paired_trajectory_key(prompt, 3) == "r2:prompt:p7:sample:0/3"
+
+    with pytest.raises(ValueError, match="prompt_id"):
+        _paired_trajectory_key({"extra_info": {"logical_step": 2}}, 0)
+    with pytest.raises(ValueError, match="logical_step"):
+        _paired_trajectory_key({"extra_info": {"logical_step": -1, "prompt_id": "p7"}}, 0)
+
+
+@pytest.mark.asyncio
+async def test_tq_prompt_injects_distinct_paired_trajectory_keys(monkeypatch):
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=1))
+    captured = []
+
+    async def fake_kv_put(**kwargs):
+        del kwargs
+
+    async def fake_run_agent_loop(sampling_params, **kwargs):
+        del kwargs
+        captured.append(dict(sampling_params))
+
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", fake_kv_put)
+    worker._run_agent_loop = fake_run_agent_loop
+
+    await worker._run_prompt(
+        prompt={
+            "uid": "sample",
+            "agent_name": "diffusion_single_turn_agent",
+            "extra_info": {"logical_step": 2, "prompt_id": "p7"},
+        },
+        sampling_params={"paired_base_seed": 123},
+        trajectory={"validate": False},
+        prompt_index=0,
+    )
+
+    assert [params["paired_trajectory_key"] for params in captured] == [
+        "r2:prompt:p7:sample:0/0",
+        "r2:prompt:p7:sample:0/1",
+    ]
+    assert {params["paired_base_seed"] for params in captured} == {123}
 
 
 @pytest.mark.asyncio

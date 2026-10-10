@@ -40,9 +40,13 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
 
     noise_level: float = 1.0
     sde_type: str = "sde"
+    sde_indices: Optional[list[int]] = None
     sde_window_size: Optional[int] = None
     sde_window_range: Optional[list[int]] = None
     sde_contiguous: bool = True
+    init_same_noise: bool = False
+    trajectory_dtype: str = "float32"
+    logprob_dtype: str = "float32"
 
     # MixGRPO-only configs
     sample_strategy: str = "random"
@@ -54,6 +58,24 @@ class DiffusionRolloutAlgoConfig(BaseConfig):
             raise ValueError(f"Unknown sample_strategy: {self.sample_strategy!r}")
         if self.sample_strategy == "progressive" and self.iters_per_group <= 0:
             raise ValueError(f"iters_per_group must be positive, got {self.iters_per_group}.")
+        if self.sde_indices is not None:
+            if not self.sde_indices:
+                raise ValueError("sde_indices must select at least one transition when set.")
+            if any(isinstance(index, bool) or not isinstance(index, int) for index in self.sde_indices):
+                raise TypeError(f"sde_indices must contain integers, got {self.sde_indices!r}.")
+            if any(index < 0 for index in self.sde_indices):
+                raise ValueError(f"sde_indices must be non-negative, got {self.sde_indices!r}.")
+            if len(set(self.sde_indices)) != len(self.sde_indices):
+                raise ValueError(f"sde_indices must not contain duplicates, got {self.sde_indices!r}.")
+        supported_dtypes = {"float16", "fp16", "bfloat16", "bf16", "float32", "fp32"}
+        if self.trajectory_dtype not in supported_dtypes:
+            raise ValueError(
+                f"Unsupported trajectory_dtype={self.trajectory_dtype!r}; expected one of {sorted(supported_dtypes)}."
+            )
+        if self.logprob_dtype not in supported_dtypes:
+            raise ValueError(
+                f"Unsupported logprob_dtype={self.logprob_dtype!r}; expected one of {sorted(supported_dtypes)}."
+            )
 
 
 @dataclass
@@ -86,6 +108,12 @@ class DiffusionPipelineConfig(BaseConfig):
 
     # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
+
+    # Flow-matching sigma-schedule shift for the audio stream.
+    audio_flow_shift: float = 3.0
+
+    # Optional seed for UniRL-compatible paired rollout noise.
+    paired_base_seed: Optional[int] = None
 
 
 @dataclass

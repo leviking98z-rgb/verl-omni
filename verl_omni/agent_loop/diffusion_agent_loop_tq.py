@@ -15,6 +15,8 @@
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
+from numbers import Integral
 from typing import Any
 
 import ray
@@ -34,6 +36,20 @@ from verl_omni.agent_loop.utils import _derive_rollout_seed
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _paired_trajectory_key(prompt: dict, session_id: int) -> str:
+    """Build the stable UniRL trajectory key from dataset metadata."""
+    extra_info = prompt.get("extra_info")
+    if not isinstance(extra_info, Mapping):
+        raise ValueError("paired rollout requires mapping-valued extra_info")
+    prompt_id = extra_info.get("prompt_id")
+    if not isinstance(prompt_id, str) or not prompt_id:
+        raise ValueError("paired rollout requires non-empty extra_info.prompt_id")
+    logical_step = extra_info.get("logical_step")
+    if isinstance(logical_step, bool) or not isinstance(logical_step, Integral) or logical_step < 0:
+        raise ValueError("paired rollout requires non-negative integer extra_info.logical_step")
+    return f"r{int(logical_step)}:prompt:{prompt_id}:sample:0/{int(session_id)}"
 
 
 @ray.remote
@@ -138,6 +154,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             n = config.val_kwargs.n if trajectory["validate"] else config.n
             for session_id in range(n):
                 run_sampling_params = dict(sampling_params)
+                paired_base_seed = run_sampling_params.get("paired_base_seed")
+                if paired_base_seed is not None:
+                    run_sampling_params["paired_base_seed"] = int(paired_base_seed)
+                    run_sampling_params["paired_trajectory_key"] = _paired_trajectory_key(prompt, session_id)
                 if rollout_base_seed is not None and not trajectory["validate"]:
                     # Seed from the global prompt index: each worker only sees a
                     # chunk of the batch, so a chunk-local position would reuse
@@ -191,6 +211,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             internal,
             uid=uid,
             session_id=session_id,
+            paired_trajectory_key=sampling_params.get("paired_trajectory_key"),
             trajectory=trajectory,
             validate=trajectory["validate"] if trajectory else False,
             global_steps=sampling_params.get("global_steps"),
@@ -203,6 +224,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         *,
         uid: str,
         session_id: int,
+        paired_trajectory_key: str | None = None,
         trajectory: dict | None,
         validate: bool,
         global_steps: int | None = None,
@@ -253,6 +275,8 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         step = trajectory["step"] if trajectory else global_steps
         extra_fields_out["min_global_steps"] = step
         extra_fields_out["max_global_steps"] = step
+        if paired_trajectory_key is not None:
+            extra_fields_out["paired_trajectory_key"] = paired_trajectory_key
         field["extra_fields"] = extra_fields_out
 
         fields_td = list_of_dict_to_tensordict([field])

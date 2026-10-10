@@ -148,9 +148,13 @@ class TestDiffusionRolloutAlgoConfig:
         cfg = DiffusionRolloutAlgoConfig()
         assert cfg.noise_level == pytest.approx(1.0)
         assert cfg.sde_type == "sde"
+        assert cfg.sde_indices is None
         assert cfg.sde_window_size is None
         assert cfg.sde_window_range is None
         assert cfg.sde_contiguous is True
+        assert cfg.init_same_noise is False
+        assert cfg.trajectory_dtype == "float32"
+        assert cfg.logprob_dtype == "float32"
 
     def test_invalid_sample_strategy_raises(self):
         with pytest.raises(ValueError, match="Unknown sample_strategy"):
@@ -160,11 +164,29 @@ class TestDiffusionRolloutAlgoConfig:
         with pytest.raises(ValueError, match="iters_per_group.*positive"):
             DiffusionRolloutAlgoConfig(sample_strategy="progressive", iters_per_group=0)
 
+    @pytest.mark.parametrize(
+        ("kwargs", "error", "match"),
+        [
+            ({"sde_indices": []}, ValueError, "at least one transition"),
+            ({"sde_indices": [0, 0]}, ValueError, "duplicates"),
+            ({"sde_indices": [-1]}, ValueError, "non-negative"),
+            ({"sde_indices": [True]}, TypeError, "integers"),
+            ({"trajectory_dtype": "int8"}, ValueError, "trajectory_dtype"),
+            ({"logprob_dtype": "float64"}, ValueError, "logprob_dtype"),
+        ],
+    )
+    def test_parity_controls_validate(self, kwargs, error, match):
+        with pytest.raises(error, match=match):
+            DiffusionRolloutAlgoConfig(**kwargs)
+
 
 class TestDiffusionSamplingConfig:
     def test_defaults(self):
         cfg = DiffusionSamplingConfig()
         assert cfg.pipeline.num_inference_steps == 10
+        assert cfg.pipeline.video_flow_shift == pytest.approx(12.0)
+        assert cfg.pipeline.audio_flow_shift == pytest.approx(3.0)
+        assert cfg.pipeline.paired_base_seed is None
         assert cfg.seed == 42
         assert isinstance(cfg.algo, DiffusionRolloutAlgoConfig)
 

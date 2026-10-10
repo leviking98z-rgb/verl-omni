@@ -188,6 +188,12 @@ val_kwargs:
     # Flow-matching sigma-schedule shift for the video stream (validation)
     video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
 
+    # Flow-matching sigma-schedule shift for the audio stream (validation)
+    audio_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.audio_flow_shift,3.0}
+
+    # Optional seed for UniRL-compatible paired rollout noise (validation)
+    paired_base_seed: ${oc.select:actor_rollout_ref.rollout.pipeline.paired_base_seed,null}
+
     # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific (validation)
     task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
 
@@ -209,6 +215,9 @@ val_kwargs:
     # SDE variant: "sde" or "cps"
     sde_type: ${oc.select:actor_rollout_ref.rollout.algo.sde_type,sde}
 
+    # Explicit denoising-transition indices; null falls back to the window controls
+    sde_indices: ${oc.select:actor_rollout_ref.rollout.algo.sde_indices,null}
+
     # Number of denoising steps selected from sde_window_range; null = all steps
     sde_window_size: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_size,null}
 
@@ -217,6 +226,15 @@ val_kwargs:
 
     # Whether selected SDE steps must form one consecutive window
     sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
+
+    # Compatibility switch for recipes that share initial prompt-group noise
+    init_same_noise: ${oc.select:actor_rollout_ref.rollout.algo.init_same_noise,false}
+
+    # Storage dtype for replay trajectory latents
+    trajectory_dtype: ${oc.select:actor_rollout_ref.rollout.algo.trajectory_dtype,float32}
+
+    # Storage dtype for rollout log probabilities
+    logprob_dtype: ${oc.select:actor_rollout_ref.rollout.algo.logprob_dtype,float32}
 
 # Rollout Algorithm configuration
 algo:
@@ -230,6 +248,9 @@ algo:
   # SDE variant: "sde" or "cps"
   sde_type: sde
 
+  # Explicit denoising-transition indices; null falls back to the window controls
+  sde_indices: null
+
   # Number of denoising steps selected from sde_window_range; null = all steps
   sde_window_size: null
 
@@ -238,6 +259,15 @@ algo:
 
   # Whether selected SDE steps must form one consecutive window
   sde_contiguous: true
+
+  # Compatibility switch for recipes that share initial prompt-group noise
+  init_same_noise: false
+
+  # Storage dtype for replay trajectory latents
+  trajectory_dtype: float32
+
+  # Storage dtype for rollout log probabilities
+  logprob_dtype: float32
 
   # MixGRPO sliding-window scheduler configs
 
@@ -286,6 +316,12 @@ pipeline:
 
   # Flow-matching sigma-schedule shift for the video stream
   video_flow_shift: 12.0
+
+  # Flow-matching sigma-schedule shift for the audio stream
+  audio_flow_shift: 3.0
+
+  # Optional seed for UniRL-compatible paired rollout noise
+  paired_base_seed: null
 
   # Task label forwarded to the vLLM-Omni request `task`, pipeline-specific
   task: null

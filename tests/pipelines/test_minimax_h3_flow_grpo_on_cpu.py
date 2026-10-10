@@ -34,7 +34,15 @@ from verl_omni.pipelines.minimax_h3_flow_grpo.common import (
     split_joint_latents,
 )
 from verl_omni.pipelines.minimax_h3_flow_grpo.diffusers_training_adapter import MiniMaxH3FlowGRPO
-from verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter import MiniMaxH3PipelineWithLogProb
+from verl_omni.pipelines.minimax_h3_flow_grpo.paired_noise import (
+    cpu_generator,
+    derive_denoise_seed,
+    derive_initial_seed,
+)
+from verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter import (
+    MiniMaxH3PipelineWithLogProb,
+    _select_sde_steps,
+)
 from verl_omni.pipelines.minimax_h3_flow_grpo.weight_sync import MiniMaxH3WeightSyncMixin
 from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer
@@ -87,6 +95,77 @@ def test_minimax_h3_flow_grpo_registers_both_adapters_and_joint_helpers() -> Non
         audio_weight=0.75,
     )
     torch.testing.assert_close(combined, torch.tensor([2.5]))
+
+
+def test_paired_noise_seed_helpers_match_unirl_values() -> None:
+    trajectory_key = "r2:prompt:p7:sample:0/3"
+
+    assert derive_initial_seed(123, trajectory_key) == 3349337498322502936
+    assert derive_initial_seed(42, "prompt:hello") == 754077156
+    assert derive_initial_seed(42, 'prompt:{"prompt":"hello","sample":3}') == 754077159
+    assert derive_denoise_seed(123, 4, trajectory_key) == 4088567592805557032
+    assert derive_denoise_seed(123, 4, f"{trajectory_key}::audio") == 7691133670550274536
+
+    expected = torch.randn(4, generator=torch.Generator(device="cpu").manual_seed(123))
+    actual = torch.randn(4, generator=cpu_generator(123))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_h3_flow_grpo_configures_paired_noise_and_shift_alias() -> None:
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "video_flow_shift": 12.0,
+                "paired_base_seed": 123,
+                "paired_trajectory_key": "r2:prompt:p7:sample:0/3",
+                "trajectory_dtype": "bf16",
+                "logprob_dtype": "fp32",
+            },
+            num_outputs_per_prompt=1,
+            max_sequence_length=1024,
+        )
+    )
+
+    pipeline._configure_flow_grpo(request)
+
+    assert request.sampling_params.extra_args["flow_shift"] == pytest.approx(12.0)
+    assert "video_flow_shift" not in request.sampling_params.extra_args
+    assert pipeline._paired_base_seed == 123
+    assert pipeline._paired_trajectory_key == "r2:prompt:p7:sample:0/3"
+    assert pipeline._flow_grpo_trajectory_dtype == torch.bfloat16
+    assert pipeline._flow_grpo_logprob_dtype == torch.float32
+
+
+def test_h3_flow_grpo_requires_both_paired_noise_parameters() -> None:
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            extra_args={"paired_base_seed": 123},
+            num_outputs_per_prompt=1,
+            max_sequence_length=1024,
+        )
+    )
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        pipeline._configure_flow_grpo(request)
+
+
+def test_h3_actor_scheduler_uses_configured_video_and_audio_shifts(monkeypatch) -> None:
+    schedulers = (object(), object())
+    model_config = SimpleNamespace(
+        pipeline=SimpleNamespace(num_inference_steps=11, video_flow_shift=12.0, audio_flow_shift=3.0)
+    )
+    schedule_mock = MagicMock(return_value=([1.0, 0.0], [1.0, 0.0]))
+    configure_mock = MagicMock()
+    module = "verl_omni.pipelines.minimax_h3_flow_grpo.diffusers_training_adapter"
+    monkeypatch.setattr(f"{module}.h3_sigma_schedules", schedule_mock)
+    monkeypatch.setattr(f"{module}.configure_flow_scheduler", configure_mock)
+
+    MiniMaxH3FlowGRPO.set_timesteps(schedulers, model_config, "cpu")
+
+    schedule_mock.assert_called_once_with(11, video_shift=12.0, audio_shift=3.0)
+    assert configure_mock.call_count == 2
 
 
 def test_h3_agent_loop_uses_parent_init_and_raw_text_tokens() -> None:
@@ -253,7 +332,7 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
         scheduler_inputs=micro_batch,
         step=0,
     )
-    torch.testing.assert_close(log_prob, torch.tensor([0.4]))
+    torch.testing.assert_close(log_prob, torch.tensor([1.0 / 3.0]))
     assert mean.shape == micro_batch["all_latents"][:, 0].shape
     assert std.shape == (1, 1, 1)
     assert sqrt_dt.shape == (1,)
@@ -349,6 +428,8 @@ class _FakeH3Branch:
         self.update_mask_dev = torch.ones(2, dtype=torch.bool)
         self.audio_update_mask = torch.ones(3, dtype=torch.bool)
         self.audio_update_mask_dev = self.audio_update_mask
+        self.x_base = torch.zeros(1, 7, H3_VIDEO_WIDTH)
+        self.audio_x_base = torch.zeros(1, 7, H3_AUDIO_WIDTH)
 
     def forward_kwargs(self, *, video_rows, audio_rows, **kwargs):
         del kwargs
@@ -372,6 +453,36 @@ def _layout_metadata() -> dict[str, torch.Tensor]:
         "h3_audio_indices": torch.tensor([[2, 3, 4]]),
         "h3_text_indices": torch.tensor([[5, 6]]),
     }
+
+
+def test_explicit_sde_indices_override_window_and_validate_bounds() -> None:
+    assert _select_sde_steps(
+        9,
+        sde_indices=[0, 3, 6],
+        window_size=2,
+        window_range=[7, 9],
+        contiguous=True,
+        seed=42,
+    ) == {0, 3, 6}
+
+    with pytest.raises(ValueError, match="duplicates"):
+        _select_sde_steps(
+            9,
+            sde_indices=[0, 3, 3],
+            window_size=None,
+            window_range=None,
+            contiguous=True,
+            seed=42,
+        )
+    with pytest.raises(ValueError, match="outside"):
+        _select_sde_steps(
+            9,
+            sde_indices=[0, 9],
+            window_size=None,
+            window_range=None,
+            contiguous=True,
+            seed=42,
+        )
 
 
 def test_rollout_denoise_window_records_replayable_aligned_trajectory(monkeypatch) -> None:
@@ -476,7 +587,7 @@ def test_rollout_denoise_window_records_replayable_aligned_trajectory(monkeypatc
     assert trajectory["h3_step_indices"].tolist() == [[1, 2]]
     torch.testing.assert_close(trajectory["all_timesteps"], torch.tensor([[0.2, 0.4]]))
     torch.testing.assert_close(trajectory["h3_audio_timesteps"], torch.tensor([[0.3, 0.5]]))
-    torch.testing.assert_close(trajectory["all_log_probs"], torch.tensor([[0.4, 0.4]]))
+    torch.testing.assert_close(trajectory["all_log_probs"], torch.tensor([[1.0 / 3.0, 1.0 / 3.0]]))
 
     # At selected step 1 the transition adds 2, and at step 2 it adds 3.
     # This checks each recorded next latent is paired with its own current latent.
@@ -487,6 +598,127 @@ def test_rollout_denoise_window_records_replayable_aligned_trajectory(monkeypatc
     pipeline.record_denoise_step.assert_any_call(1, normalized_timestep=0.8)
     pipeline.record_denoise_step.assert_any_call(2, normalized_timestep=0.6)
     pipeline.record_denoise_step.assert_called_with(None)
+
+
+def test_paired_rollout_rounds_transition_before_recomputing_cps_log_prob(monkeypatch) -> None:
+    class _FakePairedH3Branch:
+        def __init__(self, *, packed, text_embeddings, token_tags, device):
+            del packed, text_embeddings, token_tags, device
+            self.img_pos = torch.arange(2)
+            self.audio_pos = torch.arange(2, 4)
+            self.update_mask_dev = torch.ones(2, dtype=torch.bool)
+            self.audio_update_mask = torch.ones(2, dtype=torch.bool)
+            self.audio_update_mask_dev = self.audio_update_mask
+            self.x_base = torch.zeros(1, 6, H3_VIDEO_WIDTH)
+            self.audio_x_base = torch.zeros(1, 6, H3_AUDIO_WIDTH)
+
+        def forward_kwargs(self, *, video_rows, audio_rows, **kwargs):
+            del kwargs
+            return {"hidden_states": video_rows, "audio_hidden_states": audio_rows}
+
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._flow_grpo_noise_level = 0.8
+    pipeline._flow_grpo_sde_type = "cps"
+    pipeline._flow_grpo_sde_indices = [0]
+    pipeline._flow_grpo_window_size = None
+    pipeline._flow_grpo_window_range = None
+    pipeline._flow_grpo_sde_contiguous = True
+    pipeline._flow_grpo_seed = 123
+    pipeline._paired_base_seed = 321
+    pipeline._paired_trajectory_key = "r2:prompt:p7:sample:0/3"
+    pipeline._flow_grpo_trajectory_dtype = torch.float16
+    pipeline._flow_grpo_logprob_dtype = torch.float32
+    pipeline._h3_max_text_len = 2
+    pipeline._initial_noise = MagicMock(side_effect=AssertionError("paired rollout must derive its own initial noise"))
+    pipeline.record_denoise_step = MagicMock()
+    pipeline.progress_bar = lambda total: nullcontext(SimpleNamespace(update=MagicMock()))
+    pipeline._resident_dit_layers_on_device = lambda enabled: nullcontext()
+    pipeline._layout_outputs = MagicMock(return_value=_layout_metadata())
+
+    def transformer(**model_inputs):
+        assert model_inputs["hidden_states"].dtype == torch.float16
+        assert model_inputs["audio_hidden_states"].dtype == torch.float16
+        return (
+            torch.zeros_like(model_inputs["hidden_states"]),
+            torch.zeros_like(model_inputs["audio_hidden_states"]),
+        )
+
+    pipeline.transformer = transformer
+    pipeline._transformer_for_task = MagicMock(return_value=transformer)
+    calls = []
+
+    def fake_transition(_scheduler, sample, _velocity, step, **kwargs):
+        is_video = sample.shape[-1] == H3_VIDEO_WIDTH
+        calls.append((is_video, step, kwargs["generator"].device.type))
+        mean = torch.full_like(sample.float(), 0.1 if is_video else -0.2)
+        next_sample = mean + (0.0003 if is_video else -0.0004)
+        return next_sample, torch.tensor([99.0]), mean, torch.tensor(0.1), torch.tensor(0.2)
+
+    packed = {"token_tags": torch.zeros(6, dtype=torch.long), "text_pos": torch.tensor([4, 5])}
+    module = "verl_omni.pipelines.minimax_h3_flow_grpo.vllm_omni_rollout_adapter"
+    monkeypatch.setattr(f"{module}.minimax_h3_packed_sequence", lambda **kwargs: packed)
+    monkeypatch.setattr(f"{module}.MiniMaxH3DenoiseBranch", _FakePairedH3Branch)
+    monkeypatch.setattr(f"{module}.h3_sigma_schedules", lambda *args: ([1.0, 0.0], [1.0, 0.0]))
+    monkeypatch.setattr(f"{module}.configure_flow_scheduler", lambda *args: None)
+    monkeypatch.setattr(f"{module}.sample_h3_transition", fake_transition)
+    monkeypatch.setattr(f"{module}.minimax_h3_unpatchify_video_tokens", lambda *args, **kwargs: torch.tensor([11.0]))
+    monkeypatch.setattr(f"{module}.minimax_h3_unpack_audio_tokens", lambda *args, **kwargs: torch.tensor([22.0]))
+
+    pipeline.diffuse(
+        task="t2va",
+        text_embeddings=torch.randn(2, 8),
+        text_tags=torch.ones(2, dtype=torch.long),
+        seed=7,
+        latent_t=1,
+        latent_h=2,
+        latent_w=4,
+        audio_t=1,
+        num_frames=1,
+        num_steps=2,
+        video_shift=12.0,
+        audio_shift=3.0,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+    )
+
+    trajectory = pipeline._flow_grpo_trajectory
+    next_video, next_audio = split_joint_latents(trajectory["all_next_latents"][:, 0], 2, 2)
+    video_mean = torch.full_like(next_video.float(), 0.1)
+    audio_mean = torch.full_like(next_audio.float(), -0.2)
+    video_log_prob = -(next_video.float() - video_mean).square().mean(dim=(1, 2))
+    audio_log_prob = -(next_audio.float() - audio_mean).square().mean(dim=(1, 2))
+    expected = 0.75 * video_log_prob + 0.25 * audio_log_prob
+
+    assert calls == [(True, 0, "cpu"), (False, 0, "cpu")]
+    assert trajectory["all_latents"].dtype == torch.float16
+    assert trajectory["all_next_latents"].dtype == torch.float16
+    assert trajectory["all_log_probs"].dtype == torch.float32
+    torch.testing.assert_close(trajectory["all_log_probs"][:, 0], expected)
+
+
+def test_h3_decode_casts_each_latent_to_its_vae_dtype() -> None:
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.video_vae = torch.nn.Linear(1, 1, bias=False).to(dtype=torch.float16)
+    pipeline.audio_vae = torch.nn.Linear(1, 1, bias=False).to(dtype=torch.bfloat16)
+    video_latent = torch.ones(1, dtype=torch.float32)
+    audio_latent = torch.ones(1, dtype=torch.float32)
+
+    with patch.object(
+        MiniMaxH3Pipeline,
+        "decode",
+        autospec=True,
+        return_value=(torch.tensor([1.0]), torch.tensor([2.0])),
+    ) as decode:
+        output = pipeline.decode(video_latent, audio_latent, height=8, width=16)
+
+    assert output[0].item() == 1.0
+    assert output[1].item() == 2.0
+    assert decode.call_args.args[1].dtype == torch.float16
+    assert decode.call_args.args[2].dtype == torch.bfloat16
+    assert decode.call_args.kwargs == {"height": 8, "width": 16}
 
 
 def test_fl2va_denoise_keeps_condition_rows_fixed_and_scores_only_targets(monkeypatch) -> None:
